@@ -26,7 +26,7 @@ for SEED in "${SEEDS[@]}"; do
 
     PYTORCH_ALLOC_CONF=expandable_segments:True \
     SEED=$SEED \
-    torchrun --standalone --nproc_per_node=8 train_gpt.py 2>&1 | tee "$LOG"
+    .venv/bin/torchrun --standalone --nproc_per_node=8 train_gpt.py 2>&1 | tee "$LOG"
 
     # Parse final sliding-window s64 bpb (most accurate metric)
     BPB[$SEED]=$(grep "final_int6_sliding_window_s64_exact" "$LOG" | grep -oP "val_bpb:\K[0-9.]+" | tail -1)

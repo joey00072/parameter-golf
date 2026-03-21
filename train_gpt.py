@@ -27,6 +27,11 @@ except ImportError:
 import numpy as np
 import sentencepiece as spm
 import torch
+# Pre-import to avoid duplicate TritonTemplate registration bug in some torch versions
+try:
+    import torch._inductor.kernel.flex_attention as _  # noqa: F401
+except Exception:
+    pass
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
