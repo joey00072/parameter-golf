@@ -120,8 +120,8 @@ class Hyperparameters:
     late_qat = bool(int(os.environ.get("LATE_QAT", "1")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
-    biglu_bigram_vocab_size = int(os.environ.get("BIGLU_BIGRAM_VOCAB_SIZE", 5120))
-    biglu_mlp_mult = float(os.environ.get("BIGLU_MLP_MULT", 0.5))
+    biglu_bigram_vocab_size = int(os.environ.get("BIGLU_BIGRAM_VOCAB_SIZE", 2048))
+    biglu_mlp_mult = float(os.environ.get("BIGLU_MLP_MULT", 1.0))
     biglu_lr_mult = float(os.environ.get("BIGLU_LR_MULT", 10.0))
 
 # -----------------------------
@@ -1291,16 +1291,15 @@ def main() -> None:
         weight_decay=args.adam_wd,
         fused=True,
     )
-    # BigLU all params on AdamW at 10x token_lr — pull out of Muon matrix_params
+    # BigLU bigram embedding on AdamW at 10x token_lr; up/down linears stay on Muon
     biglu_lr = token_lr * args.biglu_lr_mult
     biglu_param_ids: set[int] = set()
     biglu_adam_params: list[Tensor] = []
     for name, p in base_model.blocks.named_parameters():
-        if ".mlp." in name:
+        if ".mlp.bigram." in name:
             biglu_adam_params.append(p)
             biglu_param_ids.add(id(p))
-    matrix_params = [p for p in matrix_params if id(p) not in biglu_param_ids]
-    scalar_params  = [p for p in scalar_params  if id(p) not in biglu_param_ids]
+    scalar_params = [p for p in scalar_params if id(p) not in biglu_param_ids]
 
     optimizer_muon = Muon(
         matrix_params,
