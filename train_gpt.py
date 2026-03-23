@@ -19,6 +19,18 @@ import uuid
 import zlib
 from pathlib import Path
 
+# FA3 (Hopper SM90) → FA2 → PyTorch SDPA fallback
+try:
+    from flash_attn_interface import flash_attn_func as _flash_attn_func
+    _FLASH_ATTN = 3
+except Exception:
+    try:
+        from flash_attn import flash_attn_func as _flash_attn_func
+        _FLASH_ATTN = 2
+    except Exception:
+        _flash_attn_func = None
+        _FLASH_ATTN = 0
+
 try:
     import zstandard
     _COMPRESSOR = "zstd"
@@ -554,10 +566,15 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if _FLASH_ATTN >= 3:
+            y = _flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True).transpose(1, 2)
+        elif _FLASH_ATTN == 2 and self.num_kv_heads == self.num_heads:
+            y = _flash_attn_func(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=True).transpose(1, 2)
+        else:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
