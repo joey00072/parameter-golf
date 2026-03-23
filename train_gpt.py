@@ -1526,10 +1526,10 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
-            if _WANDB_ENABLED and rank == 0:
-                wandb.log({"train/loss": train_loss.item(),
-                           "train/lr": optimizer_muon.param_groups[0]["lr"],
-                           "train/step_ms": approx_training_time_ms / step}, step=step)
+        if _WANDB_ENABLED and rank == 0:
+            wandb.log({"train/loss": train_loss.item(),
+                       "train/lr": optimizer_muon.param_groups[0]["lr"],
+                       "train/step_ms": approx_training_time_ms / step}, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
