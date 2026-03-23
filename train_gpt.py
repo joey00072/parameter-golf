@@ -90,6 +90,7 @@ class Hyperparameters:
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     biglu_vocab_size = int(os.environ.get("BIGLU_VOCAB_SIZE", 0))  # 0 = disabled
+    biglu_mult = float(os.environ.get("BIGLU_MULT", 1.0))  # hidden = biglu_mult * dim
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -576,18 +577,19 @@ class MLP(nn.Module):
 
 class BigLU(nn.Module):
     """MLP where the hidden state is gated by a per-layer bigram embedding.
-    bigram_dim = hidden (expansion scale = 1) → no projection, gate dim matches hidden."""
-    def __init__(self, dim: int, mlp_mult: float, bigram_vocab_size: int):
+    biglu_mult controls hidden size independently of mlp_mult.
+    bigram_dim = hidden (scale=1) → no projection."""
+    def __init__(self, dim: int, biglu_mult: float, bigram_vocab_size: int):
         super().__init__()
-        hidden = int(mlp_mult * dim)
+        hidden = int(biglu_mult * dim)
         self.up = CastedLinear(dim, hidden, bias=False)
         self.down = CastedLinear(hidden, dim, bias=False)
         self.down._zero_init = True
-        # bigram_dim == hidden == model_dim for BigLU → proj = None
+        # bigram_dim == hidden → proj = None
         self.bigram = BigramHashEmbedding(bigram_vocab_size, hidden, hidden)
 
     def forward(self, x: Tensor, token_ids: Tensor) -> Tensor:
-        h = torch.relu(self.up(x)).square()
+        h = F.silu(self.up(x))
         g = self.bigram(token_ids)
         return self.down(h * g)
 
@@ -632,13 +634,13 @@ class BigramHashEmbedding(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float, biglu_vocab_size: int = 0):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float, biglu_vocab_size: int = 0, biglu_mult: float = 1.0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         if biglu_vocab_size > 0:
-            self.mlp = BigLU(dim, mlp_mult, biglu_vocab_size)
+            self.mlp = BigLU(dim, biglu_mult, biglu_vocab_size)
         else:
             self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -676,6 +678,7 @@ class GPT(nn.Module):
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
         biglu_vocab_size: int = 0,
+        biglu_mult: float = 1.0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -694,7 +697,8 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList(
             [
                 Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                      biglu_vocab_size=biglu_vocab_size if (biglu_vocab_size > 0 and i % 2 == 0) else 0)
+                      biglu_vocab_size=biglu_vocab_size if (biglu_vocab_size > 0 and i % 2 == 0) else 0,
+                      biglu_mult=biglu_mult)
                 for i in range(num_layers)
             ]
         )
@@ -948,6 +952,7 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         biglu_vocab_size=args.biglu_vocab_size,
+        biglu_mult=args.biglu_mult,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
