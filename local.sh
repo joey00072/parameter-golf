@@ -7,4 +7,5 @@ set -e
 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
 TRAIN_BATCH_TOKENS=65536 \
 TRAIN_SEQ_LEN=1024 \
+WANDB_ENABLED=1 \
 torchrun --standalone --nproc_per_node=1 train_gpt.py

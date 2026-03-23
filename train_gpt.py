@@ -18,6 +18,10 @@ import uuid
 import zlib
 from pathlib import Path
 
+_WANDB_ENABLED = os.environ.get("WANDB_ENABLED", "0") == "1"
+if _WANDB_ENABLED:
+    import wandb
+
 try:
     import zstandard
     _COMPRESSOR = "zstd"
@@ -1183,6 +1187,10 @@ def main() -> None:
                 print(msg, file=f)
 
     log0(code, console=False)
+    if _WANDB_ENABLED and rank == 0:
+        wandb.init(project=os.environ.get("WANDB_PROJECT", "parameter-golf"),
+                   name=run_id, config=vars(args), resume="allow")
+
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
     log0(f"Running PyTorch {torch.__version__}", console=False)
@@ -1444,6 +1452,8 @@ def main() -> None:
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
                 f"train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms / max(step, 1):.2f}ms"
             )
+            if _WANDB_ENABLED and rank == 0:
+                wandb.log({"val/loss": val_loss, "val/bpb": val_bpb}, step=step)
             torch.cuda.synchronize()
             t0 = time.perf_counter()
 
@@ -1516,6 +1526,10 @@ def main() -> None:
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if _WANDB_ENABLED and rank == 0:
+                wandb.log({"train/loss": train_loss.item(),
+                           "train/lr": optimizer_muon.param_groups[0]["lr"],
+                           "train/step_ms": approx_training_time_ms / step}, step=step)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
