@@ -91,6 +91,7 @@ class Hyperparameters:
 
     biglu_vocab_size = int(os.environ.get("BIGLU_VOCAB_SIZE", 0))  # 0 = disabled
     biglu_mult = float(os.environ.get("BIGLU_MULT", 1.0))  # hidden = biglu_mult * dim
+    biglu_bigram_lr_mult = float(os.environ.get("BIGLU_BIGRAM_LR_MULT", 10.0))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -984,10 +985,11 @@ def main() -> None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
             matrix_params.append(base_model.bigram.proj.weight)
-    # BigLU per-layer bigram embed tables → tok optimizer (same as main bigram)
+    # BigLU per-layer bigram embed tables → tok optimizer with scaled lr
+    biglu_bigram_lr = token_lr * args.biglu_bigram_lr_mult
     for name, p in block_named_params:
         if "bigram.embed" in name:
-            tok_params.append({"params": [p], "lr": token_lr, "base_lr": token_lr})
+            tok_params.append({"params": [p], "lr": biglu_bigram_lr, "base_lr": biglu_bigram_lr})
 
     optimizer_tok = torch.optim.AdamW(
         tok_params,
