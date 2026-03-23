@@ -1189,7 +1189,7 @@ def main() -> None:
     log0(code, console=False)
     if _WANDB_ENABLED and rank == 0:
         wandb.init(project=os.environ.get("WANDB_PROJECT", "parameter-golf"),
-                   name=run_id, config=vars(args), resume="allow")
+                   name=args.run_id, config=vars(args), resume="allow")
 
     log0("=" * 100, console=False)
     log0(f"Running Python {sys.version}", console=False)
