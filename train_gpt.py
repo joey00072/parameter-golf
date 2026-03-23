@@ -89,6 +89,8 @@ class Hyperparameters:
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
+    biglu_vocab_size = int(os.environ.get("BIGLU_VOCAB_SIZE", 0))  # 0 = disabled
+
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
@@ -572,6 +574,24 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class BigLU(nn.Module):
+    """MLP where the hidden state is gated by a per-layer bigram embedding.
+    bigram_dim = hidden (expansion scale = 1) → no projection, gate dim matches hidden."""
+    def __init__(self, dim: int, mlp_mult: float, bigram_vocab_size: int):
+        super().__init__()
+        hidden = int(mlp_mult * dim)
+        self.up = CastedLinear(dim, hidden, bias=False)
+        self.down = CastedLinear(hidden, dim, bias=False)
+        self.down._zero_init = True
+        # bigram_dim == hidden == model_dim for BigLU → proj = None
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, hidden, hidden)
+
+    def forward(self, x: Tensor, token_ids: Tensor) -> Tensor:
+        h = torch.relu(self.up(x)).square()
+        g = self.bigram(token_ids)
+        return self.down(h * g)
+
+
 class SmearGate(nn.Module):
     """Blend each token's embedding with the previous token's embedding."""
     def __init__(self, dim: int):
@@ -612,22 +632,30 @@ class BigramHashEmbedding(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float):
+    def __init__(self, dim: int, num_heads: int, num_kv_heads: int, mlp_mult: float, rope_base: float, qk_gain_init: float, biglu_vocab_size: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        if biglu_vocab_size > 0:
+            self.mlp = BigLU(dim, mlp_mult, biglu_vocab_size)
+        else:
+            self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, token_ids: Tensor | None = None) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        if isinstance(self.mlp, BigLU):
+            assert token_ids is not None
+            mlp_out = self.mlp(self.mlp_norm(x), token_ids)
+        else:
+            mlp_out = self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 
@@ -647,6 +675,7 @@ class GPT(nn.Module):
         qk_gain_init: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
+        biglu_vocab_size: int = 0,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -661,10 +690,12 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.smear = SmearGate(model_dim)
+        # BigLU on every other layer (even indices: 0, 2, 4, ...) when biglu_vocab_size > 0
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
-                for _ in range(num_layers)
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                      biglu_vocab_size=biglu_vocab_size if (biglu_vocab_size > 0 and i % 2 == 0) else 0)
+                for i in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -696,12 +727,12 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, input_ids)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0, input_ids)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -722,12 +753,12 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[i](x, x0, input_ids)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            x = self.blocks[self.num_encoder_layers + i](x, x0, input_ids)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -916,6 +947,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        biglu_vocab_size=args.biglu_vocab_size,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -927,7 +959,9 @@ def main() -> None:
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
         p for name, p in block_named_params
-        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2
+        and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        and "bigram.embed" not in name  # bigram embed tables → tok optimizer, not Muon
     ]
     scalar_params = [
         p for name, p in block_named_params
@@ -945,6 +979,10 @@ def main() -> None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
             matrix_params.append(base_model.bigram.proj.weight)
+    # BigLU per-layer bigram embed tables → tok optimizer (same as main bigram)
+    for name, p in block_named_params:
+        if "bigram.embed" in name:
+            tok_params.append({"params": [p], "lr": token_lr, "base_lr": token_lr})
 
     optimizer_tok = torch.optim.AdamW(
         tok_params,
