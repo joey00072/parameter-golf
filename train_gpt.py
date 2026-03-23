@@ -222,18 +222,17 @@ def eval_val(
     rank: int,
     world_size: int,
     device: torch.device,
-    grad_accum_steps: int,
     val_tokens: Tensor,
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
-    local_batch_tokens = args.val_batch_size // (world_size * grad_accum_steps)
+    local_batch_tokens = args.val_batch_size // world_size
     if local_batch_tokens < args.train_seq_len:
         raise ValueError(
             "VAL_BATCH_SIZE must provide at least one sequence per rank; "
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
-            f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
+            f"TRAIN_SEQ_LEN={args.train_seq_len}"
         )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
@@ -1106,7 +1105,7 @@ def main() -> None:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
-                args, model, rank, world_size, device, grad_accum_steps,
+                args, model, rank, world_size, device,
                 val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
             )
             log0(
@@ -1260,7 +1259,7 @@ def main() -> None:
     else:
         log0("final_eval_mode:standard")
         q_val_loss, q_val_bpb = eval_val(
-            args, model, rank, world_size, device, grad_accum_steps,
+            args, model, rank, world_size, device,
             val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
         )
     torch.cuda.synchronize()
