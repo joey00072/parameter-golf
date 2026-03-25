@@ -1346,6 +1346,9 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
     """Convert 3D bank tensors into individual 2D tensors with standard names."""
     out: dict[str, Tensor] = {}
     n = num_layers
+    biglu_set = {i for i in range(n) if i % 3 == 0}
+    non_biglu = [i for i in range(n) if i not in biglu_set]
+    biglu_layers = sorted(biglu_set)
     for name, tensor in sd.items():
         if name == "qo_bank":
             for i in range(n):
@@ -1356,11 +1359,17 @@ def _unbank_state_dict(sd: dict[str, Tensor], num_layers: int) -> dict[str, Tens
                 out[f"blocks.{i}.attn.c_k.weight"] = tensor[i]
                 out[f"blocks.{i}.attn.c_v.weight"] = tensor[n + i]
         elif name == "mlp_up_bank":
-            for i in range(n):
-                out[f"blocks.{i}.mlp.fc.weight"] = tensor[i]
+            for bi, li in enumerate(non_biglu):
+                out[f"blocks.{li}.mlp.fc.weight"] = tensor[bi]
         elif name == "mlp_down_bank":
-            for i in range(n):
-                out[f"blocks.{i}.mlp.proj.weight"] = tensor[i]
+            for bi, li in enumerate(non_biglu):
+                out[f"blocks.{li}.mlp.proj.weight"] = tensor[bi]
+        elif name == "biglu_up_bank":
+            for bi, li in enumerate(biglu_layers):
+                out[f"blocks.{li}.biglu.up.weight"] = tensor[bi]
+        elif name == "biglu_down_bank":
+            for bi, li in enumerate(biglu_layers):
+                out[f"blocks.{li}.biglu.down.weight"] = tensor[bi]
         else:
             out[name] = tensor
     return out
@@ -1369,41 +1378,50 @@ def _rebank_state_dict(sd: dict[str, Tensor], num_layers: int, template_sd: dict
     """Convert individual 2D tensors back into 3D bank tensors."""
     out: dict[str, Tensor] = {}
     n = num_layers
+    biglu_set = {i for i in range(n) if i % 3 == 0}
+    non_biglu = [i for i in range(n) if i not in biglu_set]
+    biglu_layers = sorted(biglu_set)
     # Reconstruct banks from individual weight keys
     qo_slices = [None] * (2 * n)
     kv_slices = [None] * (2 * n)
-    up_slices = [None] * n
-    down_slices = [None] * n
+    mlp_up_slices = [None] * len(non_biglu)
+    mlp_down_slices = [None] * len(non_biglu)
+    biglu_up_slices = [None] * len(biglu_layers)
+    biglu_down_slices = [None] * len(biglu_layers)
     consumed = set()
     for i in range(n):
         qk = f"blocks.{i}.attn.c_q.weight"
         if qk in sd:
-            qo_slices[i] = sd[qk]
-            consumed.add(qk)
+            qo_slices[i] = sd[qk]; consumed.add(qk)
         ok = f"blocks.{i}.attn.proj.weight"
         if ok in sd:
-            qo_slices[n + i] = sd[ok]
-            consumed.add(ok)
+            qo_slices[n + i] = sd[ok]; consumed.add(ok)
         kk = f"blocks.{i}.attn.c_k.weight"
         if kk in sd:
-            kv_slices[i] = sd[kk]
-            consumed.add(kk)
+            kv_slices[i] = sd[kk]; consumed.add(kk)
         vk = f"blocks.{i}.attn.c_v.weight"
         if vk in sd:
-            kv_slices[n + i] = sd[vk]
-            consumed.add(vk)
-        fk = f"blocks.{i}.mlp.fc.weight"
+            kv_slices[n + i] = sd[vk]; consumed.add(vk)
+    for bi, li in enumerate(non_biglu):
+        fk = f"blocks.{li}.mlp.fc.weight"
         if fk in sd:
-            up_slices[i] = sd[fk]
-            consumed.add(fk)
-        dk = f"blocks.{i}.mlp.proj.weight"
+            mlp_up_slices[bi] = sd[fk]; consumed.add(fk)
+        dk = f"blocks.{li}.mlp.proj.weight"
         if dk in sd:
-            down_slices[i] = sd[dk]
-            consumed.add(dk)
+            mlp_down_slices[bi] = sd[dk]; consumed.add(dk)
+    for bi, li in enumerate(biglu_layers):
+        uk = f"blocks.{li}.biglu.up.weight"
+        if uk in sd:
+            biglu_up_slices[bi] = sd[uk]; consumed.add(uk)
+        dwk = f"blocks.{li}.biglu.down.weight"
+        if dwk in sd:
+            biglu_down_slices[bi] = sd[dwk]; consumed.add(dwk)
     out["qo_bank"] = torch.stack(qo_slices).to(dtype=template_sd["qo_bank"].dtype)
     out["kv_bank"] = torch.stack(kv_slices).to(dtype=template_sd["kv_bank"].dtype)
-    out["mlp_up_bank"] = torch.stack(up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
-    out["mlp_down_bank"] = torch.stack(down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
+    out["mlp_up_bank"] = torch.stack(mlp_up_slices).to(dtype=template_sd["mlp_up_bank"].dtype)
+    out["mlp_down_bank"] = torch.stack(mlp_down_slices).to(dtype=template_sd["mlp_down_bank"].dtype)
+    out["biglu_up_bank"] = torch.stack(biglu_up_slices).to(dtype=template_sd["biglu_up_bank"].dtype)
+    out["biglu_down_bank"] = torch.stack(biglu_down_slices).to(dtype=template_sd["biglu_down_bank"].dtype)
     for name, tensor in sd.items():
         if name not in consumed:
             out[name] = tensor
@@ -1915,11 +1933,14 @@ def main() -> None:
         rope_dims=args.rope_dims, ln_scale=args.ln_scale, dtg=args.dtg_enabled,
         ve_enabled=args.ve_enabled, ve_dim=args.ve_dim, ve_layers=args.ve_layers,
         gated_attention=args.gated_attention, value_residual=args.value_residual,
+        biglu_mult=args.biglu_mult, global_bigram=args.global_bigram,
     ).to(device).bfloat16()
     eval_model.qo_bank.data = eval_model.qo_bank.data.float()
     eval_model.kv_bank.data = eval_model.kv_bank.data.float()
     eval_model.mlp_up_bank.data = eval_model.mlp_up_bank.data.float()
     eval_model.mlp_down_bank.data = eval_model.mlp_down_bank.data.float()
+    eval_model.biglu_up_bank.data = eval_model.biglu_up_bank.data.float()
+    eval_model.biglu_down_bank.data = eval_model.biglu_down_bank.data.float()
     for m in eval_model.modules():
         if isinstance(m, CastedLinear):
             m.float()
