@@ -80,6 +80,8 @@ class Hyperparameters:
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 2048))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    biglu_mult    = float(os.environ.get("BIGLU_MULT",    "1.0"))
+    global_bigram = bool(int(os.environ.get("GLOBAL_BIGRAM", "0")))
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
     rope_dims = int(os.environ.get("ROPE_DIMS", 16))
     ln_scale = bool(int(os.environ.get("LN_SCALE", "1")))
@@ -704,6 +706,18 @@ class BigramHashEmbedding(nn.Module):
             h = self.proj(h)
         return h * self.scale.to(dtype=h.dtype)
 
+class BigLU(nn.Module):
+    """Bigram-Gated Linear Unit: replaces MLP in every 3rd block.
+    up/down weights come from GPT-level banks (same Muon path as MLP).
+    bigram is AdamW-tracked like global bigram."""
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, biglu_hidden: int):
+        super().__init__()
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, biglu_hidden)
+    def forward(self, x: Tensor, token_ids: Tensor, up_w: Tensor, down_w: Tensor) -> Tensor:
+        h = F.silu(F.linear(x, up_w.to(x.dtype)))
+        g = self.bigram(token_ids)   # [B, T, biglu_hidden]
+        return F.linear(h * g, down_w.to(x.dtype))
+
 class ValueEmbedding(nn.Module):
     """Reinject token identity into attention values at specific layers.
     Each table maps vocab tokens to a low-dim embedding, projected to model_dim."""
@@ -743,13 +757,21 @@ class Block(nn.Module):
         dtg: bool = False,
         gated_attention: bool = False,
         value_residual: bool = False,
+        use_biglu: bool = False,
+        biglu_hidden: int = 0,
+        bigram_vocab_size: int = 2048,
+        bigram_dim: int = 128,
     ):
         super().__init__()
+        self.use_biglu = use_biglu
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init,
                                         gated_attention=gated_attention, value_residual=value_residual)
-        self.mlp = MLP(dim, mlp_mult)
+        if use_biglu:
+            self.biglu = BigLU(bigram_vocab_size, bigram_dim, biglu_hidden)
+        else:
+            self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -760,12 +782,15 @@ class Block(nn.Module):
             nn.init.constant_(self.dtg_gate.bias, 2.0)
         else:
             self.dtg_gate = None
-    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor, down_w: Tensor, v_embed: Tensor | None = None, v0: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
+    def forward(self, x: Tensor, x0: Tensor, q_w: Tensor, k_w: Tensor, v_w: Tensor, out_w: Tensor, up_w: Tensor | None, down_w: Tensor | None, v_embed: Tensor | None = None, v0: Tensor | None = None, token_ids: Tensor | None = None) -> tuple[Tensor, Tensor | None]:
         mix = self.resid_mix.to(dtype=x.dtype)
         x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out, raw_v = self.attn(self.attn_norm(x_in) * self.ln_scale_factor, q_w, k_w, v_w, out_w, v_embed=v_embed, v0=v0)
         x_out = x_in + self.attn_scale.to(dtype=x_in.dtype)[None, None, :] * attn_out
-        x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
+        if self.use_biglu:
+            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.biglu(self.mlp_norm(x_out) * self.ln_scale_factor, token_ids, up_w, down_w)
+        else:
+            x_out = x_out + self.mlp_scale.to(dtype=x_out.dtype)[None, None, :] * self.mlp(self.mlp_norm(x_out) * self.ln_scale_factor, up_w, down_w)
         if self.dtg_gate is not None:
             gate = torch.sigmoid(self.dtg_gate(x_in.detach()))
             x_out = x_in + gate * (x_out - x_in)
@@ -798,6 +823,8 @@ class GPT(nn.Module):
         ve_layers: str = "9,10",
         gated_attention: bool = False,
         value_residual: bool = False,
+        biglu_mult: float = 1.0,
+        global_bigram: bool = False,
     ):
         super().__init__()
         self._ve_target_dim = num_kv_heads * (model_dim // num_heads)  # kv_dim for value projection
@@ -810,21 +837,34 @@ class GPT(nn.Module):
         self.mtp_num_heads = mtp_num_heads
         self.mtp_loss_weight = mtp_loss_weight
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if (global_bigram and bigram_vocab_size > 0) else None
         self.smear = SmearGate(model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        # BigLU replaces MLP in every 3rd layer (0, 3, 6, …)
+        _biglu_layer_set = {i for i in range(num_layers) if i % 3 == 0}
+        _non_biglu_layers = [i for i in range(num_layers) if i not in _biglu_layer_set]
+        _biglu_layers = sorted(_biglu_layer_set)
+        self._biglu_layer_set = _biglu_layer_set
+        self._non_biglu_layers = _non_biglu_layers
+        self._mlp_bank_map  = {li: bi for bi, li in enumerate(_non_biglu_layers)}
+        self._biglu_bank_map = {li: bi for bi, li in enumerate(_biglu_layers)}
         # Parameter banks: contiguous 3D tensors for batched optimizer
         head_dim = model_dim // num_heads
         kv_dim = num_kv_heads * head_dim
         mlp_dim = int(mlp_mult * model_dim)
+        biglu_hidden = int(biglu_mult * model_dim)
         self.num_layers = num_layers
         self.qo_bank = nn.Parameter(torch.empty(2 * num_layers, model_dim, model_dim))
         self.kv_bank = nn.Parameter(torch.empty(2 * num_layers, kv_dim, model_dim))
-        self.mlp_up_bank = nn.Parameter(torch.empty(num_layers, mlp_dim, model_dim))
-        self.mlp_down_bank = nn.Parameter(torch.empty(num_layers, model_dim, mlp_dim))
+        n_mlp = len(_non_biglu_layers)
+        n_biglu = len(_biglu_layers)
+        self.mlp_up_bank    = nn.Parameter(torch.empty(n_mlp,   mlp_dim,    model_dim))
+        self.mlp_down_bank  = nn.Parameter(torch.empty(n_mlp,   model_dim,  mlp_dim))
+        self.biglu_up_bank  = nn.Parameter(torch.empty(n_biglu, biglu_hidden, model_dim))
+        self.biglu_down_bank = nn.Parameter(torch.empty(n_biglu, model_dim,  biglu_hidden))
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -839,6 +879,10 @@ class GPT(nn.Module):
                     dtg=dtg,
                     gated_attention=gated_attention,
                     value_residual=value_residual,
+                    use_biglu=(i in _biglu_layer_set),
+                    biglu_hidden=biglu_hidden,
+                    bigram_vocab_size=bigram_vocab_size,
+                    bigram_dim=bigram_dim,
                 )
                 for i in range(num_layers)
             ]
@@ -877,17 +921,23 @@ class GPT(nn.Module):
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         n = self.num_layers
         proj_scale = 1.0 / math.sqrt(2 * n)
-        # Init banks: orthogonal, with proj layers scaled down and out/down zero-init
+        # Init attention banks (all layers)
         for i in range(n):
             nn.init.orthogonal_(self.qo_bank.data[i], gain=1.0)        # Q
             nn.init.zeros_(self.qo_bank.data[n + i])                    # Out (zero init)
             nn.init.orthogonal_(self.kv_bank.data[i], gain=1.0)        # K
             nn.init.orthogonal_(self.kv_bank.data[n + i], gain=1.0)    # V
-            nn.init.orthogonal_(self.mlp_up_bank.data[i], gain=1.0)    # MLP up
-            nn.init.zeros_(self.mlp_down_bank.data[i])                  # MLP down (zero init)
-            # Scale proj layers (out_proj and mlp_down are "proj" layers)
             self.qo_bank.data[n + i].mul_(proj_scale)
-            self.mlp_down_bank.data[i].mul_(proj_scale)
+        # Init MLP banks for non-BigLU layers
+        for bi in range(self.mlp_up_bank.shape[0]):
+            nn.init.orthogonal_(self.mlp_up_bank.data[bi], gain=1.0)
+            nn.init.zeros_(self.mlp_down_bank.data[bi])
+            self.mlp_down_bank.data[bi].mul_(proj_scale)
+        # Init BigLU banks exactly like MLP banks
+        for bi in range(self.biglu_up_bank.shape[0]):
+            nn.init.orthogonal_(self.biglu_up_bank.data[bi], gain=1.0)
+            nn.init.zeros_(self.biglu_down_bank.data[bi])
+            self.biglu_down_bank.data[bi].mul_(proj_scale)
         # Init remaining nn.Linear modules (bigram proj, mtp heads, lm_head)
         for name, module in self.named_modules():
             if isinstance(module, nn.Linear):
@@ -917,10 +967,18 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+            if i in self._biglu_layer_set:
+                bgi = self._biglu_bank_map[i]
+                x, raw_v = self.blocks[i](x, x0,
+                    self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], self.biglu_up_bank[bgi], self.biglu_down_bank[bgi],
+                    v_embed=ve, v0=v0, token_ids=input_ids)
+            else:
+                bmi = self._mlp_bank_map[i]
+                x, raw_v = self.blocks[i](x, x0,
+                    self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], self.mlp_up_bank[bmi], self.mlp_down_bank[bmi],
+                    v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -929,10 +987,18 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+            if bi in self._biglu_layer_set:
+                bgi = self._biglu_bank_map[bi]
+                x, _ = self.blocks[bi](x, x0,
+                    self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                    self.qo_bank[n + bi], self.biglu_up_bank[bgi], self.biglu_down_bank[bgi],
+                    v_embed=ve, v0=v0, token_ids=input_ids)
+            else:
+                bmi = self._mlp_bank_map[bi]
+                x, _ = self.blocks[bi](x, x0,
+                    self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                    self.qo_bank[n + bi], self.mlp_up_bank[bmi], self.mlp_down_bank[bmi],
+                    v_embed=ve, v0=v0)
         x = self.final_norm(x)
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -975,10 +1041,18 @@ class GPT(nn.Module):
         ve_cache: dict = {}
         for i in range(self.num_encoder_layers):
             ve = self._get_ve(i, input_ids, ve_cache)
-            x, raw_v = self.blocks[i](x, x0,
-                self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
-                self.qo_bank[n + i], self.mlp_up_bank[i], self.mlp_down_bank[i],
-                v_embed=ve, v0=v0)
+            if i in self._biglu_layer_set:
+                bgi = self._biglu_bank_map[i]
+                x, raw_v = self.blocks[i](x, x0,
+                    self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], self.biglu_up_bank[bgi], self.biglu_down_bank[bgi],
+                    v_embed=ve, v0=v0, token_ids=input_ids)
+            else:
+                bmi = self._mlp_bank_map[i]
+                x, raw_v = self.blocks[i](x, x0,
+                    self.qo_bank[i], self.kv_bank[i], self.kv_bank[n + i],
+                    self.qo_bank[n + i], self.mlp_up_bank[bmi], self.mlp_down_bank[bmi],
+                    v_embed=ve, v0=v0)
             if v0 is None and raw_v is not None:
                 v0 = raw_v
             skips.append(x)
@@ -987,10 +1061,18 @@ class GPT(nn.Module):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             ve = self._get_ve(bi, input_ids, ve_cache)
-            x, _ = self.blocks[bi](x, x0,
-                self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
-                self.qo_bank[n + bi], self.mlp_up_bank[bi], self.mlp_down_bank[bi],
-                v_embed=ve, v0=v0)
+            if bi in self._biglu_layer_set:
+                bgi = self._biglu_bank_map[bi]
+                x, _ = self.blocks[bi](x, x0,
+                    self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                    self.qo_bank[n + bi], self.biglu_up_bank[bgi], self.biglu_down_bank[bgi],
+                    v_embed=ve, v0=v0, token_ids=input_ids)
+            else:
+                bmi = self._mlp_bank_map[bi]
+                x, _ = self.blocks[bi](x, x0,
+                    self.qo_bank[bi], self.kv_bank[bi], self.kv_bank[n + bi],
+                    self.qo_bank[n + bi], self.mlp_up_bank[bmi], self.mlp_down_bank[bmi],
+                    v_embed=ve, v0=v0)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1479,12 +1561,16 @@ def main() -> None:
         ve_layers=args.ve_layers,
         gated_attention=args.gated_attention,
         value_residual=args.value_residual,
+        biglu_mult=args.biglu_mult,
+        global_bigram=args.global_bigram,
     ).to(device).bfloat16()
     # Banks stay FP32 (like CastedLinear weights), cast to BF16 in forward
     base_model.qo_bank.data = base_model.qo_bank.data.float()
     base_model.kv_bank.data = base_model.kv_bank.data.float()
     base_model.mlp_up_bank.data = base_model.mlp_up_bank.data.float()
     base_model.mlp_down_bank.data = base_model.mlp_down_bank.data.float()
+    base_model.biglu_up_bank.data = base_model.biglu_up_bank.data.float()
+    base_model.biglu_down_bank.data = base_model.biglu_down_bank.data.float()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1495,13 +1581,13 @@ def main() -> None:
     model = compiled_model
 
     # Optimizer split:
-    # - 4 parameter banks -> Muon (batched Newton-Schulz)
-    # - token embedding -> Adam
-    # - scalars/control tensors -> Adam
-    # - bigram proj, mtp heads, VE proj -> Adam (small matrix params not worth banking)
+    # - 6 parameter banks -> Muon (batched Newton-Schulz, reduce-scatter/all-gather)
+    # - token embedding + BigLU bigram embeds -> AdamW
+    # - scalars/control tensors + BigLU bigram scales -> AdamW
     matrix_params = [
         base_model.qo_bank, base_model.kv_bank,
         base_model.mlp_up_bank, base_model.mlp_down_bank,
+        base_model.biglu_up_bank, base_model.biglu_down_bank,
     ]
     block_named_params = list(base_model.blocks.named_parameters())
     scalar_params = [
@@ -1520,6 +1606,13 @@ def main() -> None:
         tok_params.append({"params": [base_model.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.bigram.proj is not None:
             scalar_params.append(base_model.bigram.proj.weight)
+    # BigLU bigram params treated exactly like global bigram
+    for block in base_model.blocks:
+        if block.use_biglu:
+            tok_params.append({"params": [block.biglu.bigram.embed.weight], "lr": token_lr, "base_lr": token_lr})
+            if block.biglu.bigram.proj is not None:
+                scalar_params.append(block.biglu.bigram.proj.weight)
+            # biglu.bigram.scale is already caught by the ndim<2 scalar_params loop above
     if base_model.ve_shared is not None:
         tok_params.append({"params": [base_model.ve_shared.embed.weight], "lr": token_lr, "base_lr": token_lr})
         if base_model.ve_shared.proj is not None:
